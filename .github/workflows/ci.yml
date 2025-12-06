@@ -1,50 +1,74 @@
 name: CI
 
-on: [pull_request, push]
-
-permissions:
-  checks: write
-  contents: read
+on: [push]
 
 jobs:
   main:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Create npm configuration
         run: echo "//npm.pkg.github.com/:_authToken=${token}" >> ~/.npmrc
         env:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'npm'
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          components: clippy
+          matcher: false
+          rustflags: ""
+          target: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
       - run: npm ci
       - run: npm run build
       - run: npm run test
 
   rust-tests-clippy-warnings:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
           components: clippy
+          matcher: false
+          rustflags: ""
       - uses: ./
         with:
-          name: clippy-warnings
+          args: --all-features
+          working-directory: rust_tests/clippy_warnings
 
   rust-tests-cross:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
         with:
-          targets: aarch64-unknown-linux-gnu
+          target: aarch64-unknown-linux-gnu
           components: clippy
+          matcher: false
+          rustflags: ""
       - uses: ./
         with:
-          args: --target aarch64-unknown-linux-gnu
-          use-cross: true
-          name: clippy-cross
+          args: --target aarch64-unknown-linux-gnu --all-features
+          working-directory: rust_tests/clippy_warnings
+          tool: cross
+          cache-key: 'rs-clippy-check-tests'
+
+  rust-tests-cargo-hack:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          components: clippy
+          matcher: false
+          rustflags: ""
+      - uses: ./
+        with:
+          args: --feature-powerset
+          working-directory: rust_tests/clippy_warnings
+          tool: cargo-hack
+          cache-key: 'rs-clippy-check-tests'

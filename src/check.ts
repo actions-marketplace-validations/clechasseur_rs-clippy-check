@@ -1,12 +1,4 @@
 import * as core from '@actions/core';
-import * as github from '@actions/github';
-
-const pkg = require('../package.json');
-import { plural } from './render';
-
-const USER_AGENT = `${pkg.name}/${pkg.version} (${pkg.bugs.url})`;
-
-type ChecksCreateParamsOutputAnnotations = any;
 
 interface CargoMessage {
   reason: string;
@@ -28,18 +20,26 @@ interface DiagnosticSpan {
   column_end: number;
 }
 
-interface CheckOptions {
-  token: string;
-  owner: string;
-  repo: string;
-  name: string;
-  head_sha: string;
-  started_at: string; // ISO8601
-  context: {
-    rustc: string;
-    cargo: string;
-    clippy: string;
-  };
+type FileName = string;
+type AnnotationLevel = 'notice' | 'warning' | 'error';
+
+interface FileAnnotation {
+  title: string;
+  level: AnnotationLevel;
+  beginLine: number;
+  endLine: number;
+  beginColumn?: number;
+  endColumn?: number;
+  content: string;
+}
+
+type FileAnnotations = Array<FileAnnotation>;
+
+export interface SummaryContext {
+  rustc: string;
+  cargo: string;
+  program?: string;
+  clippy: string;
 }
 
 interface Stats {
@@ -51,12 +51,14 @@ interface Stats {
 }
 
 export class CheckRunner {
-  private annotations: Array<ChecksCreateParamsOutputAnnotations>;
-  private stats: Stats;
+  private readonly _workingDirectory: string;
+  private readonly _annotations: Record<FileName, FileAnnotations>;
+  private readonly _stats: Stats;
 
-  constructor() {
-    this.annotations = [];
-    this.stats = {
+  constructor(workingDirectory?: string) {
+    this._workingDirectory = workingDirectory ? `${workingDirectory}/` : '';
+    this._annotations = {};
+    this._stats = {
       ice: 0,
       error: 0,
       warning: 0,
@@ -86,286 +88,169 @@ export class CheckRunner {
 
     switch (contents.message.level) {
       case 'help':
-        this.stats.help += 1;
+        this._stats.help += 1;
         break;
       case 'note':
-        this.stats.note += 1;
+        this._stats.note += 1;
         break;
       case 'warning':
-        this.stats.warning += 1;
+        this._stats.warning += 1;
         break;
       case 'error':
-        this.stats.error += 1;
+        this._stats.error += 1;
         break;
       case 'error: internal compiler error':
-        this.stats.ice += 1;
+        this._stats.ice += 1;
         break;
       default:
         break;
     }
 
-    this.annotations.push(CheckRunner.makeAnnotation(contents));
+    this.addAnnotation(contents);
   }
 
-  public async executeCheck(options: CheckOptions): Promise<void> {
+  public async addSummary(context: SummaryContext): Promise<void> {
     core.info(`Clippy results: \
-${this.stats.ice} ICE, ${this.stats.error} errors, \
-${this.stats.warning} warnings, ${this.stats.note} notes, \
-${this.stats.help} help`);
+${this._stats.ice} ICE, ${this._stats.error} errors, \
+${this._stats.warning} warnings, ${this._stats.note} notes, \
+${this._stats.help} help`);
 
-    // TODO: Retries
-    // TODO: Throttling
-    const client = github.getOctokit(options.token, {
-      userAgent: USER_AGENT,
-    });
-    const checkRunId = await this.createCheck(client, options);
+    // Add all the annotations now. It is limited to 10, but it's better than nothing.
+    // All annotations will also be included in the summary, below.
+    // For more information, see https://docs.github.com/en/rest/checks/runs?apiVersion=2022-11-28
+    for (const [fileName, annotations] of Object.entries(this._annotations)) {
+      for (const annotation of annotations) {
+        const properties: core.AnnotationProperties = {
+          title: annotation.title,
+          file: fileName,
+          startLine: annotation.beginLine,
+          endLine: annotation.endLine,
+        };
+        if (annotation.beginColumn) {
+          properties.startColumn = annotation.beginColumn;
+        }
+        if (annotation.endColumn) {
+          properties.endColumn = annotation.endColumn;
+        }
 
-    try {
-      if (this.isSuccessCheck()) {
-        await this.successCheck(client, checkRunId, options);
-      } else {
-        await this.runUpdateCheck(client, checkRunId, options);
-      }
-    } catch (error) {
-      await this.cancelCheck(client, checkRunId, options);
-      throw error;
-    }
-  }
-
-  private async createCheck(
-    client: any,
-    options: CheckOptions,
-  ): Promise<number> {
-    const response = await client.rest.checks.create({
-      owner: options.owner,
-      repo: options.repo,
-      name: options.name,
-      head_sha: options.head_sha,
-      status: 'in_progress',
-    });
-    // TODO: Check for errors
-
-    return response.data.id;
-  }
-
-  private async runUpdateCheck(
-    client: any,
-    checkRunId: number,
-    options: CheckOptions,
-  ): Promise<void> {
-    // Checks API allows only up to 50 annotations per request,
-    // should group them into buckets
-    let annotations = this.getBucket();
-    while (annotations.length > 0) {
-      // Request data is mostly the same for create/update calls
-      let req: any = {
-        owner: options.owner,
-        repo: options.repo,
-        name: options.name,
-        check_run_id: checkRunId,
-        output: {
-          title: options.name,
-          summary: this.getSummary(),
-          text: this.getText(options.context),
-          annotations: annotations,
-        },
-      };
-
-      if (this.annotations.length > 0) {
-        // There will be more annotations later
-        core.debug('This is not the last iteration, marking check as "in_progress"');
-        req.status = 'in_progress';
-      } else {
-        // Okay, that was the last bucket
-        const conclusion = this.getConclusion();
-        core.debug(`This is the last iteration, marking check as "completed", conclusion: ${conclusion}`);
-        req.status = 'completed';
-        req.conclusion = conclusion;
-        req.completed_at = new Date().toISOString();
-      }
-
-      // TODO: Check for errors
-      await client.rest.checks.update(req);
-
-      annotations = this.getBucket();
-    }
-
-    return;
-  }
-
-  private async successCheck(
-    client: any,
-    checkRunId: number,
-    options: CheckOptions,
-  ): Promise<void> {
-    let req: any = {
-      owner: options.owner,
-      repo: options.repo,
-      name: options.name,
-      check_run_id: checkRunId,
-      status: 'completed',
-      conclusion: this.getConclusion(),
-      completed_at: new Date().toISOString(),
-      output: {
-        title: options.name,
-        summary: this.getSummary(),
-        text: this.getText(options.context),
-      },
-    };
-
-    // TODO: Check for errors
-    await client.rest.checks.update(req);
-
-    return;
-  }
-
-  /// Cancel whole check if some unhandled exception happened.
-  private async cancelCheck(
-    client: any,
-    checkRunId: number,
-    options: CheckOptions,
-  ): Promise<void> {
-    let req: any = {
-      owner: options.owner,
-      repo: options.repo,
-      name: options.name,
-      check_run_id: checkRunId,
-      status: 'completed',
-      conclusion: 'cancelled',
-      completed_at: new Date().toISOString(),
-      output: {
-        title: options.name,
-        summary: 'Unhandled error',
-        text: 'Check was cancelled due to unhandled error. Check the Action logs for details.',
-      },
-    };
-
-    // TODO: Check for errors
-    await client.rest.checks.update(req);
-
-    return;
-  }
-
-  private getBucket(): Array<ChecksCreateParamsOutputAnnotations> {
-    // TODO: Use slice or smth?
-    let annotations: Array<ChecksCreateParamsOutputAnnotations> = [];
-    while (annotations.length < 50) {
-      const annotation = this.annotations.pop();
-      if (annotation) {
-        annotations.push(annotation);
-      } else {
-        break;
+        switch (annotation.level) {
+          case 'notice':
+            core.notice(annotation.content, properties);
+            break;
+          case 'warning':
+            core.warning(annotation.content, properties);
+            break;
+          default:
+            core.error(annotation.content, properties);
+            break;
+        }
       }
     }
 
-    core.debug(`Prepared next annotations bucket, ${annotations.length} size`);
+    // Now generate the summary with all annotations included.
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      core.summary.addHeading('Results').addTable([
+        [
+          { data: 'Message level', header: true },
+          { data: 'Amount', header: true },
+        ],
+        ['Internal compiler error', `${this._stats.ice}`],
+        ['Error', `${this._stats.error}`],
+        ['Warning', `${this._stats.warning}`],
+        ['Note', `${this._stats.note}`],
+        ['Help', `${this._stats.help}`],
+      ]);
 
-    return annotations;
-  }
+      for (const [fileName, annotations] of Object.entries(this._annotations)) {
+        const content: string = annotations
+          .sort((a, b) => {
+            let cmp: number = a.beginLine - b.beginLine;
+            if (cmp === 0) {
+              cmp = a.endLine - b.endLine;
+            }
+            return cmp;
+          })
+          .map((annotation) => {
+            const linesMsg: string = CheckRunner.linesMsg(
+              annotation.beginLine,
+              annotation.endLine,
+            );
 
-  private getSummary(): string {
-    let blocks: string[] = [];
+            return `${linesMsg}\n\n\`\`\`\n${annotation.content}\n\`\`\`\n`;
+          })
+          .join('\n');
 
-    if (this.stats.ice > 0) {
-      blocks.push(`${this.stats.ice} internal compiler error${plural(this.stats.ice)}`);
-    }
-    if (this.stats.error > 0) {
-      blocks.push(`${this.stats.error} error${plural(this.stats.error)}`);
-    }
-    if (this.stats.warning > 0) {
-      blocks.push(`${this.stats.warning} warning${plural(this.stats.warning)}`);
-    }
-    if (this.stats.note > 0) {
-      blocks.push(`${this.stats.note} note${plural(this.stats.note)}`);
-    }
-    if (this.stats.help > 0) {
-      blocks.push(`${this.stats.help} help message${plural(this.stats.help)}`);
-    }
+        core.summary.addDetails(fileName, content);
+      }
 
-    return blocks.join(', ');
-  }
-
-  private getText(context: CheckOptions['context']): string {
-    return `## Results
-
-| Message level           | Amount                |
-| ----------------------- | --------------------- |
-| Internal compiler error | ${this.stats.ice}     |
-| Error                   | ${this.stats.error}   |
-| Warning                 | ${this.stats.warning} |
-| Note                    | ${this.stats.note}    |
-| Help                    | ${this.stats.help}    |
-
-## Versions
-
-* ${context.rustc}
-* ${context.cargo}
-* ${context.clippy}
-`;
-  }
-
-  private getConclusion(): string {
-    if (this.stats.ice > 0 || this.stats.error > 0) {
-      return 'failure';
-    } else {
-      return 'success';
+      return core.summary
+        .addHeading('Versions')
+        .addList([
+          context.rustc,
+          context.cargo,
+          ...(context.program ? [context.program] : []),
+          context.clippy,
+        ])
+        .write()
+        .then((_summary) => {});
     }
   }
 
-  private isSuccessCheck(): boolean {
-    return (
-      this.stats.ice == 0 &&
-      this.stats.error == 0 &&
-      this.stats.warning == 0 &&
-      this.stats.note == 0 &&
-      this.stats.help == 0
-    );
-  }
-
-  /// Convert parsed JSON line into the GH annotation object
-  ///
-  /// https://developer.github.com/v3/checks/runs/#annotations-object
-  static makeAnnotation(
-    contents: CargoMessage,
-  ): ChecksCreateParamsOutputAnnotations {
+  private addAnnotation(contents: CargoMessage): void {
     const primarySpan: undefined | DiagnosticSpan = contents.message.spans.find(
-      (span) => span.is_primary == true,
+      (span) => span.is_primary,
     );
-    // TODO: Handle it properly
-    if (null == primarySpan) {
-      throw new Error('Unable to find primary span for message');
+    if (!primarySpan) {
+      core.debug(
+        `Unable to find primary span for message '${contents.message}', ignoring it`,
+      );
+      return;
     }
 
-    let annotation_level: ChecksCreateParamsOutputAnnotations['annotation_level'];
-    // notice, warning, or failure.
-    switch (contents.message.level) {
-      case 'help':
-      case 'note':
-        annotation_level = 'notice';
-        break;
-      case 'warning':
-        annotation_level = 'warning';
-        break;
-      default:
-        annotation_level = 'failure';
-        break;
-    }
+    // Fix file_name to include workingDirectory
+    const fileName: string = `${this._workingDirectory}${primarySpan.file_name}`;
+    const rendered: string = contents.message.rendered.replace(
+      primarySpan.file_name,
+      fileName,
+    );
 
-    let annotation: ChecksCreateParamsOutputAnnotations = {
-      path: primarySpan.file_name,
-      start_line: primarySpan.line_start,
-      end_line: primarySpan.line_end,
-      annotation_level: annotation_level,
+    const fileAnnotation: FileAnnotation = {
       title: contents.message.message,
-      message: contents.message.rendered,
+      level: CheckRunner.annotationLevel(contents.message.level),
+      beginLine: primarySpan.line_start,
+      endLine: primarySpan.line_end,
+      content: rendered,
     };
 
     // Omit these parameters if `start_line` and `end_line` have different values.
     if (primarySpan.line_start == primarySpan.line_end) {
-      annotation.start_column = primarySpan.column_start;
-      annotation.end_column = primarySpan.column_end;
+      fileAnnotation.beginColumn = primarySpan.column_start;
+      fileAnnotation.endColumn = primarySpan.column_end;
     }
 
-    return annotation;
+    if (!this._annotations[fileName]) {
+      this._annotations[fileName] = [];
+    }
+    this._annotations[fileName].push(fileAnnotation);
+  }
+
+  private static annotationLevel(
+    messageLevel: CargoMessage['message']['level'],
+  ): AnnotationLevel {
+    switch (messageLevel) {
+      case 'help':
+      case 'note':
+        return 'notice';
+      case 'warning':
+        return 'warning';
+      default:
+        return 'error';
+    }
+  }
+
+  private static linesMsg(beginLine: number, endLine: number): string {
+    return beginLine == endLine
+      ? `Line ${beginLine}`
+      : `Lines ${beginLine}-${endLine}`;
   }
 }

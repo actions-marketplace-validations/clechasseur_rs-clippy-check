@@ -8,11 +8,11 @@ import stringArgv from 'string-argv';
 
 // Parsed action input
 export interface Input {
-  token: string;
   toolchain?: string;
   args: string[];
-  useCross: boolean;
-  name: string;
+  workingDirectory?: string;
+  tool?: string;
+  cacheKey?: string;
 }
 
 export function get(): Input {
@@ -21,14 +21,15 @@ export function get(): Input {
   if (toolchain.startsWith('+')) {
     toolchain = toolchain.slice(1);
   }
-  const useCross = input.getInputBool('use-cross');
-  const name = input.getInput('name');
+  const workingDirectory = input.getInput('working-directory');
+  const tool = input.getInput('tool');
+  const cacheKey = input.getInput('cache-key');
 
   return {
-    token: input.getInput('token'),
     args: args,
-    useCross: useCross,
     toolchain: toolchain || undefined,
-    name,
+    workingDirectory: workingDirectory || undefined,
+    tool: tool || undefined,
+    cacheKey: cacheKey || undefined,
   };
 }
