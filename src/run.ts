@@ -10,8 +10,8 @@ import {
   CrossOptions,
 } from '@clechasseur/rs-actions-core';
 
-import * as input from './input';
-import { CheckRunner } from './check';
+import * as input from './input.js';
+import { CheckRunner } from './check.js';
 
 async function getProgram(actionInput: input.Input) {
   switch (actionInput.tool) {
@@ -104,7 +104,7 @@ export async function run(actionInput: input.Input): Promise<void> {
   await runner.addSummary({
     rustc: rustcVersion,
     cargo: cargoVersion,
-    ...(programVersion !== cargoVersion && { program: programVersion }),
+    ...(actionInput.tool && { program: programVersion }),
     clippy: clippyVersion,
   });
 
